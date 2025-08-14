@@ -43,9 +43,13 @@ type RpcResponse struct {
 	Error   string      `json:"error,omitempty"`
 }
 
-// establishConnection initializes the database connection pool.
+// establishConnection initializes the database connection pool using environment variables.
 func establishConnection() {
 	once.Do(func() {
+		// --- SECURITY BEST PRACTICE ---
+		// The connection string is fetched from an environment variable.
+		// This prevents hardcoding secrets in the source code.
+		// You MUST set `DB_CONN_STRING` in your Vercel project settings.
 		connStr := os.Getenv("DB_CONN_STRING")
 		if connStr == "" {
 			log.Fatal("FATAL: DB_CONN_STRING environment variable not set.")
@@ -252,18 +256,21 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 // corsMiddleware adds the necessary CORS headers.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Set your frontend's Vercel URL here or use "*" for development
-		// For production, it's better to get this from an environment variable.
+		// --- SECURITY BEST PRACTICE ---
+		// The allowed origin for CORS is also read from an environment variable.
+		// This allows you to easily change the frontend URL without changing code.
+		// You MUST set `ALLOWED_ORIGIN` in your Vercel project settings.
 		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 		if allowedOrigin == "" {
-			allowedOrigin = "*" // Fallback for local dev
+			// Fallback for local development if the variable isn't set.
+			allowedOrigin = "*"
 		}
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
-		// Handle preflight requests
+		// Handle preflight (OPTIONS) requests
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -285,10 +292,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	})
 	mux.HandleFunc("/rpc", rpcHandler)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		http.NotFound(w, r)
+		// Respond with a 404 for any path that isn't /health or /rpc
+		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
 	})
 
-	// Wrap the router with CORS middleware
+	// Wrap the entire router with the CORS middleware
 	handler := corsMiddleware(mux)
 	handler.ServeHTTP(w, r)
 }
