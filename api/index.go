@@ -1,4 +1,4 @@
-package handler
+package main
 
 import (
 	"context"
@@ -43,7 +43,67 @@ type RpcResponse struct {
 	Error   string      `json:"error,omitempty"`
 }
 
-// establishConnection initializes the database connection pool using environment variables.
+// --- CORS ALWAYS applied middleware ---
+
+func withCORS(fn http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+		origin := r.Header.Get("Origin")
+		if allowedOrigin == "" {
+			allowedOrigin = "*"
+		}
+
+		if allowedOrigin == "*" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else if origin != "" && (allowedOrigin == origin || strings.Contains(allowedOrigin, origin)) {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
+		// Preflight
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		// Always continue with main handler
+		fn(w, r)
+	}
+}
+
+// --- Main handler for Vercel ---
+
+func Handler(w http.ResponseWriter, r *http.Request) {
+	withCORS(mainHandler)(w, r)
+}
+
+func mainHandler(w http.ResponseWriter, r *http.Request) {
+	// DB Connection: initialize once for serverless
+	if err := establishConnection(); err != nil {
+		log.Printf("Database connection error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, RpcResponse{
+			Success: false,
+			Error:   "Internal server error - database connection failed",
+		})
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rpc", rpcHandler)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
+	})
+
+	mux.ServeHTTP(w, r)
+}
+
 func establishConnection() error {
 	var err error
 	once.Do(func() {
@@ -73,74 +133,12 @@ func establishConnection() error {
 	return err
 }
 
-// writeJSON is a helper to write JSON responses.
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
 		log.Printf("Error writing JSON response: %v", err)
 	}
-}
-
-// bulletproof cors middleware
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
-		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-		origin := r.Header.Get("Origin")
-		if allowedOrigin == "" {
-			allowedOrigin = "*"
-		}
-
-		if allowedOrigin == "*" {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		} else {
-			if origin != "" && (allowedOrigin == origin || strings.Contains(allowedOrigin, origin)) {
-				w.Header().Set("Access-Control-Allow-Origin", origin)
-				w.Header().Set("Vary", "Origin")
-			} else {
-				// Origin not allowed; optionally log or handle blocking here.
-				log.Printf("CORS origin rejected: %s", origin)
-			}
-		}
-
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
-		// Preflight
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		next.ServeHTTP(w, r)
-	})
-}
-
-// Handler is the main entry point for Vercel.
-func Handler(w http.ResponseWriter, r *http.Request) {
-	if err := establishConnection(); err != nil {
-		log.Printf("Database connection error: %v", err)
-		writeJSON(w, http.StatusInternalServerError, RpcResponse{
-			Success: false,
-			Error:   "Internal server error - database connection failed",
-		})
-		return
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", rpcHandler)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
-	})
-
-	handler := corsMiddleware(mux)
-	handler.ServeHTTP(w, r)
 }
 
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
