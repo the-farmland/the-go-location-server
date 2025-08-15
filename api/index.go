@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,22 +82,38 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
-// corsMiddleware adds the necessary CORS headers.
+// bulletproof cors middleware
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+
 		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+		origin := r.Header.Get("Origin")
 		if allowedOrigin == "" {
-			allowedOrigin = "*" // Fallback for safety
+			allowedOrigin = "*"
 		}
-		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+
+		if allowedOrigin == "*" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+		} else {
+			if origin != "" && (allowedOrigin == origin || strings.Contains(allowedOrigin, origin)) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Vary", "Origin")
+			} else {
+				// Origin not allowed; optionally log or handle blocking here.
+				log.Printf("CORS origin rejected: %s", origin)
+			}
+		}
+
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 
+		// Preflight
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
+
 		next.ServeHTTP(w, r)
 	})
 }
@@ -197,14 +214,20 @@ func rpcDispatcher(ctx context.Context, req RpcRequest) RpcResponse {
 func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ Limit int `json:"limit"` }
 	p.Limit = 10
-	if err := json.Unmarshal(params, &p); err != nil { return nil, err }
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, err
+	}
 	rows, err := dbpool.Query(ctx, "SELECT * FROM get_top_locations($1);", p.Limit)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var locations []Location
 	for rows.Next() {
 		var loc Location
-		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil { return nil, err }
+		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil {
+			return nil, err
+		}
 		locations = append(locations, loc)
 	}
 	return locations, nil
@@ -212,23 +235,33 @@ func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, 
 
 func getLocationById(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(params, &p); err != nil || p.ID == "" { return nil, fmt.Errorf("invalid or missing 'id'") }
+	if err := json.Unmarshal(params, &p); err != nil || p.ID == "" {
+		return nil, fmt.Errorf("invalid or missing 'id'")
+	}
 	var loc Location
 	err := dbpool.QueryRow(ctx, "SELECT * FROM get_location_by_id($1);", p.ID).Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating)
-	if err != nil { return nil, fmt.Errorf("location not found") }
+	if err != nil {
+		return nil, fmt.Errorf("location not found")
+	}
 	return loc, nil
 }
 
 func searchLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ Query string `json:"query"` }
-	if err := json.Unmarshal(params, &p); err != nil || p.Query == "" { return nil, fmt.Errorf("invalid or missing 'query'") }
+	if err := json.Unmarshal(params, &p); err != nil || p.Query == "" {
+		return nil, fmt.Errorf("invalid or missing 'query'")
+	}
 	rows, err := dbpool.Query(ctx, "SELECT * FROM search_locations($1);", p.Query)
-	if err != nil { return nil, err }
+	if err != nil {
+		return nil, err
+	}
 	defer rows.Close()
 	var locations []Location
 	for rows.Next() {
 		var loc Location
-		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil { return nil, err }
+		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil {
+			return nil, err
+		}
 		locations = append(locations, loc)
 	}
 	return locations, nil
@@ -248,7 +281,9 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 	var blocked bool
 	err := dbpool.QueryRow(ctx, "SELECT is_user_blocked($1);", userid).Scan(&blocked)
 	if err != nil {
-		if err.Error() == "no rows in result set" { return false, nil }
+		if err.Error() == "no rows in result set" {
+			return false, nil
+		}
 		return false, err
 	}
 	return blocked, nil
