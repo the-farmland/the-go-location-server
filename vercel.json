@@ -9,7 +9,8 @@
   "routes": [
     {
       "src": "/(.*)",
-      "dest": "/api/index.go"
+      "dest": "/api/index.go",
+      "methods": ["GET", "POST", "OPTIONS"]
     }
   ]
 }

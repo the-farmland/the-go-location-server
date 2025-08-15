@@ -1,4 +1,4 @@
-package main
+package handler
 
 import (
 	"context"
@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -43,67 +42,7 @@ type RpcResponse struct {
 	Error   string      `json:"error,omitempty"`
 }
 
-// --- CORS ALWAYS applied middleware ---
-
-func withCORS(fn http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-		origin := r.Header.Get("Origin")
-		if allowedOrigin == "" {
-			allowedOrigin = "*"
-		}
-
-		if allowedOrigin == "*" {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-		} else if origin != "" && (allowedOrigin == origin || strings.Contains(allowedOrigin, origin)) {
-			w.Header().Set("Access-Control-Allow-Origin", origin)
-			w.Header().Set("Vary", "Origin")
-		}
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
-		// Preflight
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		// Always continue with main handler
-		fn(w, r)
-	}
-}
-
-// --- Main handler for Vercel ---
-
-func Handler(w http.ResponseWriter, r *http.Request) {
-	withCORS(mainHandler)(w, r)
-}
-
-func mainHandler(w http.ResponseWriter, r *http.Request) {
-	// DB Connection: initialize once for serverless
-	if err := establishConnection(); err != nil {
-		log.Printf("Database connection error: %v", err)
-		writeJSON(w, http.StatusInternalServerError, RpcResponse{
-			Success: false,
-			Error:   "Internal server error - database connection failed",
-		})
-		return
-	}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", rpcHandler)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
-	})
-
-	mux.ServeHTTP(w, r)
-}
-
+// establishConnection initializes the database connection pool using environment variables.
 func establishConnection() error {
 	var err error
 	once.Do(func() {
@@ -133,6 +72,7 @@ func establishConnection() error {
 	return err
 }
 
+// writeJSON is a helper to write JSON responses.
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -141,10 +81,57 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
+// corsMiddleware adds the necessary CORS headers.
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+		if allowedOrigin == "" {
+			allowedOrigin = "*" 
+		}
+
+		if r.Method == http.MethodOptions {
+			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Handler is the main entry point for Vercel.
+func Handler(w http.ResponseWriter, r *http.Request) {
+	if err := establishConnection(); err != nil {
+		log.Printf("Database connection error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, RpcResponse{
+			Success: false,
+			Error:   "Internal server error - database connection failed",
+		})
+		return
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rpc", rpcHandler)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("OK"))
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
+	})
+
+	handler := corsMiddleware(mux)
+	handler.ServeHTTP(w, r)
+}
+
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return
+		return nil
 	}
 
 	var req RpcRequest
@@ -212,20 +199,14 @@ func rpcDispatcher(ctx context.Context, req RpcRequest) RpcResponse {
 func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ Limit int `json:"limit"` }
 	p.Limit = 10
-	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, err
-	}
+	if err := json.Unmarshal(params, &p); err != nil { return nil, err }
 	rows, err := dbpool.Query(ctx, "SELECT * FROM get_top_locations($1);", p.Limit)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer rows.Close()
 	var locations []Location
 	for rows.Next() {
 		var loc Location
-		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil {
-			return nil, err
-		}
+		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil { return nil, err }
 		locations = append(locations, loc)
 	}
 	return locations, nil
@@ -233,33 +214,23 @@ func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, 
 
 func getLocationById(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ ID string `json:"id"` }
-	if err := json.Unmarshal(params, &p); err != nil || p.ID == "" {
-		return nil, fmt.Errorf("invalid or missing 'id'")
-	}
+	if err := json.Unmarshal(params, &p); err != nil || p.ID == "" { return nil, fmt.Errorf("invalid or missing 'id'") }
 	var loc Location
 	err := dbpool.QueryRow(ctx, "SELECT * FROM get_location_by_id($1);", p.ID).Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating)
-	if err != nil {
-		return nil, fmt.Errorf("location not found")
-	}
+	if err != nil { return nil, fmt.Errorf("location not found") }
 	return loc, nil
 }
 
 func searchLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ Query string `json:"query"` }
-	if err := json.Unmarshal(params, &p); err != nil || p.Query == "" {
-		return nil, fmt.Errorf("invalid or missing 'query'")
-	}
+	if err := json.Unmarshal(params, &p); err != nil || p.Query == "" { return nil, fmt.Errorf("invalid or missing 'query'") }
 	rows, err := dbpool.Query(ctx, "SELECT * FROM search_locations($1);", p.Query)
-	if err != nil {
-		return nil, err
-	}
+	if err != nil { return nil, err }
 	defer rows.Close()
 	var locations []Location
 	for rows.Next() {
 		var loc Location
-		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil {
-			return nil, err
-		}
+		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil { return nil, err }
 		locations = append(locations, loc)
 	}
 	return locations, nil
@@ -279,10 +250,10 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 	var blocked bool
 	err := dbpool.QueryRow(ctx, "SELECT is_user_blocked($1);", userid).Scan(&blocked)
 	if err != nil {
-		if err.Error() == "no rows in result set" {
-			return false, nil
-		}
+		if err.Error() == "no rows in result set" { return false, nil }
 		return false, err
 	}
 	return blocked, nil
 }
+
+export default Handler;
