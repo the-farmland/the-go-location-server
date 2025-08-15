@@ -83,28 +83,43 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 
 // corsMiddleware adds the necessary CORS headers.
 func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-		if allowedOrigin == "" {
-			allowedOrigin = "*" 
-		}
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+        if allowedOrigin == "" {
+            allowedOrigin = "*" 
+        }
 
-		if r.Method == http.MethodOptions {
-			w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-			w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			w.Header().Set("Access-Control-Max-Age", "86400")
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
+        if r.Method == http.MethodOptions {
+            w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+            w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+            w.Header().Set("Access-Control-Max-Age", "86400")
+            w.WriteHeader(http.StatusNoContent)
+            return
+        }
 
-		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-		next.ServeHTTP(w, r)
-	})
+        w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+        next.ServeHTTP(w, r)
+    })
 }
+
 
 // Handler is the main entry point for Vercel.
 func Handler(w http.ResponseWriter, r *http.Request) {
+    allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+    if allowedOrigin == "" {
+        allowedOrigin = "*" 
+    }
+    w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+
+    if r.Method == http.MethodOptions {
+        w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        w.Header().Set("Access-Control-Max-Age", "86400")
+        w.WriteHeader(http.StatusNoContent)
+        return
+    }
+	
 	if err := establishConnection(); err != nil {
 		log.Printf("Database connection error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, RpcResponse{
