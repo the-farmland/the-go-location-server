@@ -14,21 +14,24 @@ import (
 	"github.com/rs/cors"
 )
 
+// Global database connection pool
 var (
 	dbpool *pgxpool.Pool
 	once   sync.Once
 )
 
+// Location struct matches the database schema.
 type Location struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
 	Country     string  `json:"country"`
-	State       *string `json:"state"`
+	State       *string `json:"state"` // Use pointer for nullable fields
 	Description *string `json:"description"`
 	SVGLink     *string `json:"svg_link"`
 	Rating      float64 `json:"rating"`
 }
 
+// Structs for JSON-RPC requests and responses
 type RpcRequest struct {
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
@@ -40,6 +43,7 @@ type RpcResponse struct {
 	Error   string      `json:"error,omitempty"`
 }
 
+// establishConnection initializes the database connection pool using environment variables.
 func establishConnection() error {
 	var err error
 	once.Do(func() {
@@ -69,6 +73,7 @@ func establishConnection() error {
 	return err
 }
 
+// writeJSON is a helper to write JSON responses.
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -77,8 +82,56 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
-// This contains your routing logic
-func mainHandler(w http.ResponseWriter, r *http.Request) {
+// corsMiddleware creates a new CORS handler with configured options
+func corsMiddleware(next http.Handler) http.Handler {
+	corsHandler := cors.New(cors.Options{
+		AllowedOrigins: []string{
+			"http://localhost:3000",
+			"https://the-super-sweet-two.vercel.app",
+			"*", // Allowing all origins for development - restrict this in production
+		},
+		AllowedMethods: []string{
+			http.MethodGet,
+			http.MethodPost,
+			http.MethodPut,
+			http.MethodPatch,
+			http.MethodDelete,
+			http.MethodOptions,
+		},
+		AllowedHeaders: []string{
+			"Accept",
+			"Authorization",
+			"Content-Type",
+			"X-CSRF-Token",
+			"X-Requested-With",
+		},
+		ExposedHeaders:   []string{"Link"},
+		AllowCredentials: true,
+		MaxAge:          300, // Maximum value not ignored by any of major browsers
+		Debug:           false,
+	})
+	return corsHandler.Handler(next)
+}
+
+// Handler is the main entry point for Vercel.
+func Handler(w http.ResponseWriter, r *http.Request) {
+	// Set security headers
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.Header().Set("X-XSS-Protection", "1; mode=block")
+	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+
+	// Handle preflight requests
+	if r.Method == http.MethodOptions {
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
+		w.Header().Set("Access-Control-Max-Age", "300")
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
 	if err := establishConnection(); err != nil {
 		log.Printf("Database connection error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, RpcResponse{
@@ -88,15 +141,18 @@ func mainHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	switch {
-	case r.URL.Path == "/rpc":
-		rpcHandler(w, r)
-	case r.URL.Path == "/health":
+	mux := http.NewServeMux()
+	mux.HandleFunc("/rpc", rpcHandler)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("OK"))
-	default:
+	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
-	}
+	})
+
+	handler := corsMiddleware(mux)
+	handler.ServeHTTP(w, r)
 }
 
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
@@ -243,16 +299,4 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 		return false, err
 	}
 	return blocked, nil
-}
-
-// ✅ Exported function for Vercel
-func Handler(w http.ResponseWriter, r *http.Request) {
-	corsMiddleware := cors.New(cors.Options{
-		AllowedOrigins:   []string{"*"}, // replace with []string{os.Getenv("ALLOWED_ORIGIN")} in prod
-		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "Authorization"},
-		AllowCredentials: true,
-		MaxAge:           86400,
-	})
-	corsMiddleware.Handler(http.HandlerFunc(mainHandler)).ServeHTTP(w, r)
 }
