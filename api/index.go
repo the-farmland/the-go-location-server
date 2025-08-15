@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/rs/cors"
 )
 
 // Global database connection pool
@@ -20,30 +19,51 @@ var (
 	once   sync.Once
 )
 
-// Location struct matches the database schema.
+// Location struct matches the database schema
 type Location struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
 	Country     string  `json:"country"`
-	State       *string `json:"state"` // Use pointer for nullable fields
+	State       *string `json:"state"`
 	Description *string `json:"description"`
 	SVGLink     *string `json:"svg_link"`
 	Rating      float64 `json:"rating"`
 }
 
-// Structs for JSON-RPC requests and responses
-type RpcRequest struct {
-	Method string          `json:"method"`
-	Params json.RawMessage `json:"params"`
+// JSON-RPC 2.0 Request and Response
+type JsonRpcRequest struct {
+	Jsonrpc string          `json:"jsonrpc"`
+	Method  string          `json:"method"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	ID      interface{}     `json:"id,omitempty"`
 }
 
-type RpcResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
+type JsonRpcResponse struct {
+	Jsonrpc string      `json:"jsonrpc"`
+	Result  interface{} `json:"result,omitempty"`
+	Error   *RpcError   `json:"error,omitempty"`
+	ID      interface{} `json:"id"`
 }
 
-// establishConnection initializes the database connection pool using environment variables.
+type RpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+	Data    string `json:"data,omitempty"`
+}
+
+func NewRpcError(code int, message, data string, id interface{}) *JsonRpcResponse {
+	return &JsonRpcResponse{
+		Jsonrpc: "2.0",
+		Error: &RpcError{
+			Code:    code,
+			Message: message,
+			Data:    data,
+		},
+		ID: id,
+	}
+}
+
+// establishConnection initializes the database connection pool
 func establishConnection() error {
 	var err error
 	once.Do(func() {
@@ -63,81 +83,65 @@ func establishConnection() error {
 		config.MinConns = 0
 		config.MaxConnIdleTime = 10 * time.Second
 
-		dbpool, errParse = pgxpool.NewWithConfig(context.Background(), config)
-		if errParse != nil {
-			err = fmt.Errorf("unable to create connection pool: %v", errParse)
+		dbpool, err = pgxpool.NewWithConfig(context.Background(), config)
+		if err != nil {
+			err = fmt.Errorf("unable to create connection pool: %v", err)
 			return
 		}
+
 		log.Println("Database connection pool established.")
 	})
 	return err
 }
 
-// writeJSON is a helper to write JSON responses.
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
+// corsMiddleware adds CORS headers and handles OPTIONS preflight
+func corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+		if allowedOrigin == "" {
+			allowedOrigin = "*" // fallback
+		}
+
+		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		w.Header().Set("Content-Type", "application/json")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// writeJSON writes a JSON response with proper headers
+func writeJSON(w http.ResponseWriter, status int, response *JsonRpcResponse) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
+	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Error writing JSON response: %v", err)
 	}
 }
 
-// corsMiddleware creates a new CORS handler with configured options
-func corsMiddleware(next http.Handler) http.Handler {
-	corsHandler := cors.New(cors.Options{
-		AllowedOrigins: []string{
-			"http://localhost:3000",
-			"https://the-super-sweet-two.vercel.app",
-			"*", // Allowing all origins for development - restrict this in production
-		},
-		AllowedMethods: []string{
-			http.MethodGet,
-			http.MethodPost,
-			http.MethodPut,
-			http.MethodPatch,
-			http.MethodDelete,
-			http.MethodOptions,
-		},
-		AllowedHeaders: []string{
-			"Accept",
-			"Authorization",
-			"Content-Type",
-			"X-CSRF-Token",
-			"X-Requested-With",
-		},
-		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: true,
-		MaxAge:          300, // Maximum value not ignored by any of major browsers
-		Debug:           false,
-	})
-	return corsHandler.Handler(next)
-}
-
-// Handler is the main entry point for Vercel.
+// Handler is the main entry point for Vercel
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Set security headers
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("X-XSS-Protection", "1; mode=block")
-	w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
-
-	// Handle preflight requests
-	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Credentials", "true")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Accept, Authorization, Content-Type, X-CSRF-Token")
-		w.Header().Set("Access-Control-Max-Age", "300")
-		w.WriteHeader(http.StatusNoContent)
-		return
-	}
+	// Ensure CORS headers are set even on early errors
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("Panic: %v", r)
+			response := NewRpcError(-32603, "Internal error", "panic occurred", nil)
+			writeJSON(w, http.StatusInternalServerError, response)
+		}
+	}()
 
 	if err := establishConnection(); err != nil {
 		log.Printf("Database connection error: %v", err)
-		writeJSON(w, http.StatusInternalServerError, RpcResponse{
-			Success: false,
-			Error:   "Internal server error - database connection failed",
-		})
+		response := NewRpcError(-32603, "Internal error", "failed to connect to database", nil)
+		writeJSON(w, http.StatusInternalServerError, response)
 		return
 	}
 
@@ -145,10 +149,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	mux.HandleFunc("/rpc", rpcHandler)
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
+		_, _ = w.Write([]byte("OK"))
 	})
 
 	handler := corsMiddleware(mux)
@@ -156,129 +157,169 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }
 
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
+	var req JsonRpcRequest
+	var id interface{}
+
 	if r.Method != http.MethodPost {
-		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
+		writeJSON(w, http.StatusMethodNotAllowed, NewRpcError(-32600, "Invalid method", "Only POST allowed", nil))
 		return
 	}
 
-	var req RpcRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, RpcResponse{Success: false, Error: "Invalid JSON"})
+	// Decode request
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, NewRpcError(-32700, "Parse error", "Invalid JSON", nil))
 		return
 	}
 
-	var paramsWithUserid struct {
-		Userid string `json:"userid"`
-	}
-	userid := ""
-	if err := json.Unmarshal(req.Params, &paramsWithUserid); err == nil && paramsWithUserid.Userid != "" {
-		userid = paramsWithUserid.Userid
+	// Enforce JSON-RPC 2.0
+	if req.Jsonrpc != "2.0" {
+		writeJSON(w, http.StatusBadRequest, NewRpcError(-32600, "Invalid Request", "jsonrpc must be '2.0'", nil))
+		return
 	}
 
+	// Capture ID for response
+	id = req.ID
+
+	// Optional userid in params
+	var userid string
+	if req.Params != nil {
+		var paramsMap map[string]interface{}
+		if json.Unmarshal(req.Params, &paramsMap) == nil {
+			if uid, ok := paramsMap["userid"].(string); ok && uid != "" {
+				userid = uid
+			}
+		}
+	}
+
+	// Rate limiting and logging
 	if userid != "" {
 		blocked, err := isUserBlocked(r.Context(), userid)
 		if err != nil {
 			log.Printf("Error checking if user is blocked: %v", err)
-			writeJSON(w, http.StatusInternalServerError, RpcResponse{Success: false, Error: "Internal server error"})
+			writeJSON(w, http.StatusInternalServerError, NewRpcError(-32603, "Internal error", "rate limit check failed", id))
 			return
 		}
 		if blocked {
-			writeJSON(w, http.StatusTooManyRequests, RpcResponse{Success: false, Error: "You have exceeded the rate limit"})
+			writeJSON(w, http.StatusTooManyRequests, NewRpcError(-32001, "Rate limit exceeded", "Too many requests", id))
 			return
 		}
 		if err := logUserRequest(r.Context(), userid); err != nil {
-			log.Printf("Error logging user request: %v", err)
+			log.Printf("Error logging request: %v", err)
 		}
 	}
 
-	response := rpcDispatcher(r.Context(), req)
-
-	if userid != "" && response.Success {
-		if err := logUserResponse(r.Context(), userid); err != nil {
-			log.Printf("Error logging user response: %v", err)
-		}
-	}
-
-	writeJSON(w, http.StatusOK, response)
-}
-
-func rpcDispatcher(ctx context.Context, req RpcRequest) RpcResponse {
-	var data interface{}
-	var err error
+	// Dispatch method
+	var result interface{}
+	var rpcError *RpcError
 
 	switch req.Method {
 	case "getTopLocations":
-		data, err = getTopLocations(ctx, req.Params)
+		result, rpcError = handleGetTopLocations(r.Context(), req.Params)
 	case "getLocationById":
-		data, err = getLocationById(ctx, req.Params)
+		result, rpcError = handleGetLocationById(r.Context(), req.Params)
 	case "searchLocations":
-		data, err = searchLocations(ctx, req.Params)
+		result, rpcError = handleSearchLocations(r.Context(), req.Params)
 	default:
-		err = fmt.Errorf("method '%s' not found", req.Method)
+		rpcError = &RpcError{Code: -32601, Message: "Method not found", Data: req.Method}
 	}
 
-	if err != nil {
-		return RpcResponse{Success: false, Error: err.Error()}
+	// Build response
+	var response *JsonRpcResponse
+	if rpcError != nil {
+		response = &JsonRpcResponse{
+			Jsonrpc: "2.0",
+			Error:   rpcError,
+			ID:      id,
+		}
+	} else {
+		response = &JsonRpcResponse{
+			Jsonrpc: "2.0",
+			Result:  result,
+			ID:      id,
+		}
 	}
-	return RpcResponse{Success: true, Data: data}
+
+	// Log success
+	if userid != "" && rpcError == nil {
+		if err := logUserResponse(r.Context(), userid); err != nil {
+			log.Printf("Error logging response: %v", err)
+		}
+	}
+
+	// Use 200 OK even on RPC errors (per JSON-RPC spec)
+	writeJSON(w, http.StatusOK, response)
 }
 
-func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
+// Handlers
+func handleGetTopLocations(ctx context.Context, params json.RawMessage) (interface{}, *RpcError) {
 	var p struct{ Limit int `json:"limit"` }
 	p.Limit = 10
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, err
+		return nil, &RpcError{Code: -32602, Message: "Invalid params", Data: "limit must be a number"}
 	}
+	if p.Limit < 1 || p.Limit > 100 {
+		p.Limit = 10
+	}
+
 	rows, err := dbpool.Query(ctx, "SELECT * FROM get_top_locations($1);", p.Limit)
 	if err != nil {
-		return nil, err
+		log.Printf("DB query error in getTopLocations: %v", err)
+		return nil, &RpcError{Code: -32603, Message: "Internal error", Data: "failed to fetch locations"}
 	}
 	defer rows.Close()
+
 	var locations []Location
 	for rows.Next() {
 		var loc Location
 		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil {
-			return nil, err
+			return nil, &RpcError{Code: -32603, Message: "Internal error", Data: "failed to parse location"}
 		}
 		locations = append(locations, loc)
 	}
 	return locations, nil
 }
 
-func getLocationById(ctx context.Context, params json.RawMessage) (interface{}, error) {
+func handleGetLocationById(ctx context.Context, params json.RawMessage) (interface{}, *RpcError) {
 	var p struct{ ID string `json:"id"` }
 	if err := json.Unmarshal(params, &p); err != nil || p.ID == "" {
-		return nil, fmt.Errorf("invalid or missing 'id'")
+		return nil, &RpcError{Code: -32602, Message: "Invalid params", Data: "missing or invalid id"}
 	}
+
 	var loc Location
-	err := dbpool.QueryRow(ctx, "SELECT * FROM get_location_by_id($1);", p.ID).Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating)
+	err := dbpool.QueryRow(ctx, "SELECT * FROM get_location_by_id($1);", p.ID).Scan(
+		&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("location not found")
+		return nil, &RpcError{Code: -32000, Message: "Location not found", Data: err.Error()}
 	}
 	return loc, nil
 }
 
-func searchLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
+func handleSearchLocations(ctx context.Context, params json.RawMessage) (interface{}, *RpcError) {
 	var p struct{ Query string `json:"query"` }
 	if err := json.Unmarshal(params, &p); err != nil || p.Query == "" {
-		return nil, fmt.Errorf("invalid or missing 'query'")
+		return nil, &RpcError{Code: -32602, Message: "Invalid params", Data: "query is required"}
 	}
+
 	rows, err := dbpool.Query(ctx, "SELECT * FROM search_locations($1);", p.Query)
 	if err != nil {
-		return nil, err
+		return nil, &RpcError{Code: -32603, Message: "Internal error", Data: "search failed"}
 	}
 	defer rows.Close()
+
 	var locations []Location
 	for rows.Next() {
 		var loc Location
 		if err := rows.Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating); err != nil {
-			return nil, err
+			return nil, &RpcError{Code: -32603, Message: "Internal error", Data: "failed to parse search result"}
 		}
 		locations = append(locations, loc)
 	}
 	return locations, nil
 }
 
+// Utility DB functions
 func logUserRequest(ctx context.Context, userid string) error {
 	_, err := dbpool.Exec(ctx, "SELECT log_user_request($1);", userid)
 	return err
