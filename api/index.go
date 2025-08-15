@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.comcom/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Global database connection pool
@@ -43,30 +43,33 @@ type RpcResponse struct {
 }
 
 // establishConnection initializes the database connection pool using environment variables.
-func establishConnection() {
+func establishConnection() error {
+	var err error
 	once.Do(func() {
-		// --- THIS IS THE CRITICAL PART ---
-		// It reads the database URL from the Vercel environment.
 		connStr := os.Getenv("DB_CONN_STRING")
 		if connStr == "" {
-			log.Fatal("FATAL: DB_CONN_STRING environment variable not set. Function cannot start.")
+			err = fmt.Errorf("DB_CONN_STRING environment variable not set")
+			return
 		}
 
-		config, err := pgxpool.ParseConfig(connStr)
-		if err != nil {
-			log.Fatalf("Unable to parse connection string: %v\n", err)
+		config, errParse := pgxpool.ParseConfig(connStr)
+		if errParse != nil {
+			err = fmt.Errorf("unable to parse connection string: %v", errParse)
+			return
 		}
 
 		config.MaxConns = 1
 		config.MinConns = 0
 		config.MaxConnIdleTime = 10 * time.Second
 
-		dbpool, err = pgxpool.NewWithConfig(context.Background(), config)
-		if err != nil {
-			log.Fatalf("Unable to create connection pool: %v\n", err)
+		dbpool, errParse = pgxpool.NewWithConfig(context.Background(), config)
+		if errParse != nil {
+			err = fmt.Errorf("unable to create connection pool: %v", errParse)
+			return
 		}
 		log.Println("Database connection pool established.")
 	})
+	return err
 }
 
 // writeJSON is a helper to write JSON responses.
@@ -81,7 +84,6 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 // corsMiddleware adds the necessary CORS headers.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// It reads the allowed frontend URL from the Vercel environment.
 		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 		if allowedOrigin == "" {
 			allowedOrigin = "*" // Fallback for safety
@@ -101,7 +103,14 @@ func corsMiddleware(next http.Handler) http.Handler {
 
 // Handler is the main entry point for Vercel.
 func Handler(w http.ResponseWriter, r *http.Request) {
-	establishConnection()
+	if err := establishConnection(); err != nil {
+		log.Printf("Database connection error: %v", err)
+		writeJSON(w, http.StatusInternalServerError, RpcResponse{
+			Success: false,
+			Error:   "Internal server error - database connection failed",
+		})
+		return
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/rpc", rpcHandler)
@@ -117,9 +126,6 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	handler.ServeHTTP(w, r)
 }
 
-// --- All other functions (rpcHandler, getTopLocations, etc.) remain the same ---
-// (The full code from the previous response goes here)
-// ...
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
