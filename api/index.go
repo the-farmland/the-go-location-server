@@ -77,6 +77,7 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
+// This contains your routing logic
 func mainHandler(w http.ResponseWriter, r *http.Request) {
 	if err := establishConnection(); err != nil {
 		log.Printf("Database connection error: %v", err)
@@ -244,11 +245,14 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 	return blocked, nil
 }
 
-// Exported for Vercel: wraps everything with CORS middleware
-var Handler = cors.New(cors.Options{
-	AllowedOrigins:   []string{"*"}, // or []string{os.Getenv("ALLOWED_ORIGIN")}
-	AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
-	AllowedHeaders:   []string{"Content-Type", "Authorization"},
-	AllowCredentials: true,
-	MaxAge:           86400,
-}).Handler(http.HandlerFunc(mainHandler))
+// ✅ Exported function for Vercel
+func Handler(w http.ResponseWriter, r *http.Request) {
+	corsMiddleware := cors.New(cors.Options{
+		AllowedOrigins:   []string{"*"}, // replace with []string{os.Getenv("ALLOWED_ORIGIN")} in prod
+		AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: true,
+		MaxAge:           86400,
+	})
+	corsMiddleware.Handler(http.HandlerFunc(mainHandler)).ServeHTTP(w, r)
+}
