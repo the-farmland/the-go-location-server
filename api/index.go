@@ -30,7 +30,7 @@ type Location struct {
 	Rating      float64 `json:"rating"`
 }
 
-// JSON-RPC 2.0 Request and Response
+// JSON-RPC 2.0 structs
 type JsonRpcRequest struct {
 	Jsonrpc string          `json:"jsonrpc"`
 	Method  string          `json:"method"`
@@ -94,13 +94,13 @@ func establishConnection() error {
 	return err
 }
 
-// corsMiddleware adds CORS headers and handles OPTIONS preflight
+// corsMiddleware adds CORS headers and handles preflight (OPTIONS)
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		origin := r.Header.Get("Origin")
+		// Get allowed origin from environment, fallback to * if not set
 		allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 		if allowedOrigin == "" {
-			allowedOrigin = "*" // fallback
+			allowedOrigin = "*"
 		}
 
 		w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
@@ -109,11 +109,13 @@ func corsMiddleware(next http.Handler) http.Handler {
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.Header().Set("Content-Type", "application/json")
 
+		// Handle preflight requests
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 
+		// Call the next handler
 		next.ServeHTTP(w, r)
 	})
 }
@@ -129,17 +131,17 @@ func writeJSON(w http.ResponseWriter, status int, response *JsonRpcResponse) {
 
 // Handler is the main entry point for Vercel
 func Handler(w http.ResponseWriter, r *http.Request) {
-	// Ensure CORS headers are set even on early errors
+	// Ensure CORS headers are applied even during panics or early errors
 	defer func() {
 		if r := recover(); r != nil {
-			log.Printf("Panic: %v", r)
-			response := NewRpcError(-32603, "Internal error", "panic occurred", nil)
+			log.Printf("Panic recovered: %v", r)
+			response := NewRpcError(-32603, "Internal error", "server panic", nil)
 			writeJSON(w, http.StatusInternalServerError, response)
 		}
 	}()
 
 	if err := establishConnection(); err != nil {
-		log.Printf("Database connection error: %v", err)
+		log.Printf("Database connection failed: %v", err)
 		response := NewRpcError(-32603, "Internal error", "failed to connect to database", nil)
 		writeJSON(w, http.StatusInternalServerError, response)
 		return
@@ -151,37 +153,37 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("OK"))
 	})
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusNotFound, NewRpcError(-32600, "Not Found", "Endpoint not found", nil))
+	})
 
 	handler := corsMiddleware(mux)
 	handler.ServeHTTP(w, r)
 }
 
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
-	var req JsonRpcRequest
-	var id interface{}
-
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, NewRpcError(-32600, "Invalid method", "Only POST allowed", nil))
 		return
 	}
 
-	// Decode request
+	var req JsonRpcRequest
+	var id interface{}
+
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, NewRpcError(-32700, "Parse error", "Invalid JSON", nil))
 		return
 	}
 
-	// Enforce JSON-RPC 2.0
 	if req.Jsonrpc != "2.0" {
 		writeJSON(w, http.StatusBadRequest, NewRpcError(-32600, "Invalid Request", "jsonrpc must be '2.0'", nil))
 		return
 	}
 
-	// Capture ID for response
 	id = req.ID
 
-	// Optional userid in params
+	// Extract userid if present
 	var userid string
 	if req.Params != nil {
 		var paramsMap map[string]interface{}
@@ -192,11 +194,11 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Rate limiting and logging
+	// Rate limiting check
 	if userid != "" {
 		blocked, err := isUserBlocked(r.Context(), userid)
 		if err != nil {
-			log.Printf("Error checking if user is blocked: %v", err)
+			log.Printf("Rate limit check failed: %v", err)
 			writeJSON(w, http.StatusInternalServerError, NewRpcError(-32603, "Internal error", "rate limit check failed", id))
 			return
 		}
@@ -205,7 +207,7 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := logUserRequest(r.Context(), userid); err != nil {
-			log.Printf("Error logging request: %v", err)
+			log.Printf("Failed to log request: %v", err)
 		}
 	}
 
@@ -240,18 +242,17 @@ func rpcHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Log success
+	// Log successful response
 	if userid != "" && rpcError == nil {
 		if err := logUserResponse(r.Context(), userid); err != nil {
-			log.Printf("Error logging response: %v", err)
+			log.Printf("Failed to log response: %v", err)
 		}
 	}
 
-	// Use 200 OK even on RPC errors (per JSON-RPC spec)
 	writeJSON(w, http.StatusOK, response)
 }
 
-// Handlers
+// Handler functions
 func handleGetTopLocations(ctx context.Context, params json.RawMessage) (interface{}, *RpcError) {
 	var p struct{ Limit int `json:"limit"` }
 	p.Limit = 10
@@ -319,7 +320,7 @@ func handleSearchLocations(ctx context.Context, params json.RawMessage) (interfa
 	return locations, nil
 }
 
-// Utility DB functions
+// DB utility functions
 func logUserRequest(ctx context.Context, userid string) error {
 	_, err := dbpool.Exec(ctx, "SELECT log_user_request($1);", userid)
 	return err
