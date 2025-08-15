@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/rs/cors"
 )
 
 var (
@@ -76,34 +77,7 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	}
 }
 
-// bulletproofCORS applies to every request — preflight or otherwise
-func bulletproofCORS(w http.ResponseWriter, r *http.Request) bool {
-	allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
-	if allowedOrigin == "" {
-		allowedOrigin = "*" // fallback to allow all origins
-	}
-	w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-	w.Header().Set("Vary", "Origin")
-	w.Header().Set("Access-Control-Allow-Credentials", "true")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-	w.Header().Set("Access-Control-Max-Age", "86400")
-
-	// If it's a preflight OPTIONS request, end it here
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return true
-	}
-	return false
-}
-
-// Handler is the main entry point for Vercel
-func Handler(w http.ResponseWriter, r *http.Request) {
-	// CORS always first
-	if stop := bulletproofCORS(w, r); stop {
-		return
-	}
-
+func mainHandler(w http.ResponseWriter, r *http.Request) {
 	if err := establishConnection(); err != nil {
 		log.Printf("Database connection error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, RpcResponse{
@@ -269,3 +243,12 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 	}
 	return blocked, nil
 }
+
+// Exported for Vercel: wraps everything with CORS middleware
+var Handler = cors.New(cors.Options{
+	AllowedOrigins:   []string{"*"}, // or []string{os.Getenv("ALLOWED_ORIGIN")}
+	AllowedMethods:   []string{"GET", "POST", "OPTIONS"},
+	AllowedHeaders:   []string{"Content-Type", "Authorization"},
+	AllowCredentials: true,
+	MaxAge:           86400,
+}).Handler(http.HandlerFunc(mainHandler))
