@@ -74,11 +74,17 @@ func establishConnection() error {
 
 // writeJSON is a helper to write JSON responses.
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("Error writing JSON response: %v", err)
-	}
+    allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
+    if allowedOrigin == "" {
+        allowedOrigin = "*" 
+    }
+    w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
+
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    if err := json.NewEncoder(w).Encode(data); err != nil {
+        log.Printf("Error writing JSON response: %v", err)
+    }
 }
 
 // corsMiddleware adds the necessary CORS headers.
@@ -119,29 +125,33 @@ func Handler(w http.ResponseWriter, r *http.Request) {
         w.WriteHeader(http.StatusNoContent)
         return
     }
-	
-	if err := establishConnection(); err != nil {
-		log.Printf("Database connection error: %v", err)
-		writeJSON(w, http.StatusInternalServerError, RpcResponse{
-			Success: false,
-			Error:   "Internal server error - database connection failed",
-		})
-		return
-	}
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", rpcHandler)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
-	})
+    if err := establishConnection(); err != nil {
+        log.Printf("Database connection error: %v", err)
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusInternalServerError)
+        json.NewEncoder(w).Encode(RpcResponse{
+            Success: false,
+            Error:   "Internal server error - database connection failed",
+        })
+        return
+    }
 
-	handler := corsMiddleware(mux)
-	handler.ServeHTTP(w, r)
+    mux := http.NewServeMux()
+    mux.HandleFunc("/rpc", rpcHandler)
+    mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+        w.WriteHeader(http.StatusOK)
+        w.Write([]byte("OK"))
+    })
+    mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        json.NewEncoder(w).Encode(RpcResponse{Success: false, Error: "Not Found"})
+    })
+
+    handler := http.Handler(mux)
+    handler.ServeHTTP(w, r)
 }
+
+
 
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
