@@ -67,7 +67,7 @@ func NewRpcError(code int, message, data string, id interface{}) *JsonRpcRespons
 func establishConnection() error {
 	var err error
 	once.Do(func() {
-		connStr := os.Getenv("DB_CONN_STRING")
+		connStr := os.Getenv("postgresql://postgres.vxqsqaysrpxliofqxjyu:the-plus-maps-password@aws-0-us-east-2.pooler.supabase.com:5432/postgres?sslmode=require")
 		if connStr == "" {
 			err = fmt.Errorf("DB_CONN_STRING environment variable not set")
 			return
