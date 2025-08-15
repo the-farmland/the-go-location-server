@@ -131,7 +131,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 func rpcHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Invalid request method", http.StatusMethodNotAllowed)
-		return nil
+		return
 	}
 
 	var req RpcRequest
@@ -255,5 +255,3 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 	}
 	return blocked, nil
 }
-
-export default Handler;
