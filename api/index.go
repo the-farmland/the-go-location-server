@@ -245,7 +245,8 @@ func logUserRequest(ctx context.Context, userid string) error {
 	return err
 }
 
-func logUserResponse(ctx context..Context, userid string) error {
+// THIS IS THE CORRECTED FUNCTION
+func logUserResponse(ctx context.Context, userid string) error {
 	_, err := dbpool.Exec(ctx, "SELECT log_user_response($1);", userid)
 	return err
 }
