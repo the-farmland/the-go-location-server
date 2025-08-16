@@ -1,3 +1,4 @@
+// File: the-go-location-server-main/api/index.go
 package handler
 
 import (
@@ -7,19 +8,17 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"sync"
 	"time"
 
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Global database connection pool
-var (
-	dbpool *pgxpool.Pool
-	once   sync.Once
-)
+// Global database connection pool, initialized once.
+var dbpool *pgxpool.Pool
 
-// Location struct
+// Location struct matches the database schema.
 type Location struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
@@ -30,243 +29,172 @@ type Location struct {
 	Rating      float64 `json:"rating"`
 }
 
-// RPC structs
+// RpcRequest struct for JSON-RPC requests.
 type RpcRequest struct {
 	Method string          `json:"method"`
 	Params json.RawMessage `json:"params"`
 }
 
-type RpcResponse struct {
-	Success bool        `json:"success"`
-	Data    interface{} `json:"data,omitempty"`
-	Error   string      `json:"error,omitempty"`
-}
-
-// writeJSON with guaranteed CORS headers
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	// 🔥 Always set CORS headers, even on 500 or startup errors
-	setCORSHeaders(w)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("Error writing JSON response: %v", err)
+// init runs once when the serverless function is initialized.
+// It establishes the database connection.
+func init() {
+	connStr := os.Getenv("DB_CONN_STRING")
+	if connStr == "" {
+		log.Fatal("FATAL: DB_CONN_STRING environment variable not set")
 	}
+
+	config, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		log.Fatalf("FATAL: Unable to parse connection string: %v", err)
+	}
+
+	config.MaxConns = 2 // A small pool is fine for serverless
+	config.MinConns = 0
+	config.MaxConnIdleTime = 30 * time.Second
+
+	dbpool, err = pgxpool.NewWithConfig(context.Background(), config)
+	if err != nil {
+		log.Fatalf("FATAL: Unable to create connection pool: %v", err)
+	}
+
+	log.Println("Database connection pool established successfully.")
 }
 
-// setCORSHeaders ensures CORS is applied on every response
-func setCORSHeaders(w http.ResponseWriter) {
+// Handler is the main entry point for Vercel. It sets up the Gin engine.
+func Handler(w http.ResponseWriter, r *http.Request) {
+	// Set Gin to release mode for production on Vercel
+	gin.SetMode(gin.ReleaseMode)
+
+	// Create a new Gin engine
+	router := gin.New()
+
+	// Use Gin's logger and recovery middleware
+	router.Use(gin.Logger())
+	router.Use(gin.Recovery())
+
+	// --- Bulletproof CORS Configuration ---
+	// This middleware is now the first thing to execute on any request.
 	allowedOrigin := os.Getenv("ALLOWED_ORIGIN")
 	if allowedOrigin == "" {
-		allowedOrigin = "*" // fallback
-	}
-	w.Header().Set("Access-Control-Allow-Origin", allowedOrigin)
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-	w.Header().Set("Access-Control-Max-Age", "86400")
-}
-
-// corsMiddleware handles OPTIONS and wraps requests
-func corsMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		setCORSHeaders(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// establishConnection with robust error handling
-func establishConnection() error {
-	var err error
-	once.Do(func() {
-		connStr := os.Getenv("DB_CONN_STRING")
-		if connStr == "" {
-			err = fmt.Errorf("DB_CONN_STRING environment variable is not set")
-			log.Printf("❌ Error: %v", err)
-			return
-		}
-
-		// 🔧 Fix: Ensure SSL mode is required and connection params are correct
-		connStr += "?sslmode=require&connect_timeout=10&pool_max_conns=1"
-
-		config, parseErr := pgxpool.ParseConfig(connStr)
-		if parseErr != nil {
-			err = fmt.Errorf("failed to parse connection string: %v", parseErr)
-			log.Printf("❌ Error: %v", err)
-			return
-		}
-
-		// Set connection limits
-		config.MaxConns = 1
-		config.MinConns = 0
-		config.MaxConnLifetime = 5 * time.Minute
-		config.MaxConnIdleTime = 30 * time.Second
-		config.HealthCheckPeriod = 1 * time.Minute
-
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-
-		dbpool, err = pgxpool.NewWithConfig(ctx, config)
-		if err != nil {
-			err = fmt.Errorf("failed to create connection pool: %v", err)
-			log.Printf("❌ Error: %v", err)
-			return
-		}
-
-		// Test the connection
-		if err = dbpool.Ping(ctx); err != nil {
-			err = fmt.Errorf("failed to ping database: %v", err)
-			log.Printf("❌ Error: %v", err)
-			dbpool.Close()
-			dbpool = nil
-			return
-		}
-
-		log.Println("✅ Database connection pool established and tested.")
-	})
-	return err
-}
-
-// Handler - main entry point
-func Handler(w http.ResponseWriter, r *http.Request) {
-	// 🛡️ Always set CORS headers — even if panic or DB fails
-	setCORSHeaders(w)
-
-	// Handle OPTIONS early
-	if r.Method == http.MethodOptions {
-		w.WriteHeader(http.StatusNoContent)
-		return
+		// Fallback to a restrictive default if not set, to avoid accidental open CORS.
+		// For development, you can set this to "http://localhost:3000" in your .env file.
+		// For production, set it to your actual frontend URL.
+		allowedOrigin = "null" // Or a specific domain
+		log.Println("WARNING: ALLOWED_ORIGIN not set. CORS will likely fail.")
 	}
 
-	// Defer recovery to prevent crashes from killing response
-	defer func() {
-		if rec := recover(); rec != nil {
-			log.Printf("⚠️ Panic recovered: %v", rec)
-			writeJSON(w, http.StatusInternalServerError, RpcResponse{
-				Success: false,
-				Error:   "Internal server error",
-			})
-		}
-	}()
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{allowedOrigin},
+		AllowMethods:     []string{"POST", "GET", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "Accept"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
 
-	// Connect to DB
-	if err := establishConnection(); err != nil {
-		log.Printf("❌ DB connection failed: %v", err)
-		writeJSON(w, http.StatusInternalServerError, RpcResponse{
-			Success: false,
-			Error:   "Failed to connect to database. Please try again later.",
-		})
-		return
-	}
-
-	// Routes
-	mux := http.NewServeMux()
-	mux.HandleFunc("/rpc", rpcHandler)
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		setCORSHeaders(w)
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("OK"))
-	})
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusNotFound, RpcResponse{Success: false, Error: "Not Found"})
+	// --- API Routes ---
+	router.POST("/rpc", rpcHandler)
+	router.GET("/health", func(c *gin.Context) {
+		c.String(http.StatusOK, "OK")
 	})
 
-	// Apply CORS
-	handler := corsMiddleware(mux)
-	handler.ServeHTTP(w, r)
+	// --- Handle 404 Not Found ---
+	router.NoRoute(func(c *gin.Context) {
+		c.JSON(http.StatusNotFound, gin.H{"success": false, "error": "Not Found"})
+	})
+
+	// Let Gin handle the request
+	router.ServeHTTP(w, r)
 }
 
-func rpcHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, RpcResponse{Success: false, Error: "Method not allowed"})
+// rpcHandler processes all JSON-RPC requests.
+func rpcHandler(c *gin.Context) {
+	// Ensure the database pool is available.
+	if dbpool == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Internal server error: database connection not available"})
 		return
 	}
 
 	var req RpcRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, RpcResponse{Success: false, Error: "Invalid JSON"})
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": "Invalid JSON payload"})
 		return
 	}
 
-	var userid string
+	// --- Rate Limiting Logic ---
 	var paramsWithUserid struct {
 		Userid string `json:"userid"`
 	}
+	userid := ""
 	if err := json.Unmarshal(req.Params, &paramsWithUserid); err == nil && paramsWithUserid.Userid != "" {
 		userid = paramsWithUserid.Userid
 	}
 
 	if userid != "" {
-		blocked, err := isUserBlocked(r.Context(), userid)
+		blocked, err := isUserBlocked(c.Request.Context(), userid)
 		if err != nil {
-			log.Printf("Rate limit check failed: %v", err)
-			writeJSON(w, http.StatusInternalServerError, RpcResponse{Success: false, Error: "Internal error"})
+			log.Printf("Error checking if user is blocked: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": "Internal server error"})
 			return
 		}
 		if blocked {
-			writeJSON(w, http.StatusTooManyRequests, RpcResponse{Success: false, Error: "Rate limit exceeded"})
+			c.JSON(http.StatusTooManyRequests, gin.H{"success": false, "error": "You have exceeded the rate limit"})
 			return
 		}
-		if err := logUserRequest(r.Context(), userid); err != nil {
-			log.Printf("Failed to log request: %v", err)
+		if err := logUserRequest(c.Request.Context(), userid); err != nil {
+			log.Printf("Error logging user request: %v", err)
+		}
+	}
+	// --- End Rate Limiting ---
+
+	// Dispatch to the correct function based on the method
+	data, err := rpcDispatcher(c.Request.Context(), req)
+
+	if err != nil {
+		// Log the internal error details
+		log.Printf("RPC Dispatch Error for method '%s': %v", req.Method, err)
+		// Return a generic error to the client
+		c.JSON(http.StatusOK, gin.H{"success": false, "error": err.Error()})
+		return
+	}
+
+	// Log successful response if user is identified
+	if userid != "" {
+		if err := logUserResponse(c.Request.Context(), userid); err != nil {
+			log.Printf("Error logging user response: %v", err)
 		}
 	}
 
-	response := rpcDispatcher(r.Context(), req)
-
-	if userid != "" && response.Success {
-		if err := logUserResponse(r.Context(), userid); err != nil {
-			log.Printf("Failed to log response: %v", err)
-		}
-	}
-
-	writeJSON(w, http.StatusOK, response)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
-func rpcDispatcher(ctx context.Context, req RpcRequest) RpcResponse {
+// rpcDispatcher calls the appropriate data-fetching function.
+func rpcDispatcher(ctx context.Context, req RpcRequest) (interface{}, error) {
 	switch req.Method {
 	case "getTopLocations":
-		data, err := getTopLocations(ctx, req.Params)
-		if err != nil {
-			return RpcResponse{Success: false, Error: err.Error()}
-		}
-		return RpcResponse{Success: true, Data: data}
+		return getTopLocations(ctx, req.Params)
 	case "getLocationById":
-		data, err := getLocationById(ctx, req.Params)
-		if err != nil {
-			return RpcResponse{Success: false, Error: err.Error()}
-		}
-		return RpcResponse{Success: true, Data: data}
+		return getLocationById(ctx, req.Params)
 	case "searchLocations":
-		data, err := searchLocations(ctx, req.Params)
-		if err != nil {
-			return RpcResponse{Success: false, Error: err.Error()}
-		}
-		return RpcResponse{Success: true, Data: data}
+		return searchLocations(ctx, req.Params)
 	default:
-		return RpcResponse{Success: false, Error: "Method not found"}
+		return nil, fmt.Errorf("method '%s' not found", req.Method)
 	}
 }
 
-// Database Handlers
+// --- Database Functions (Unchanged Logic) ---
+
 func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ Limit int `json:"limit"` }
-	p.Limit = 10
+	p.Limit = 10 // Default limit
 	if err := json.Unmarshal(params, &p); err != nil {
-		return nil, fmt.Errorf("invalid limit")
+		return nil, fmt.Errorf("invalid parameters for getTopLocations: %w", err)
 	}
-	if p.Limit < 1 || p.Limit > 100 {
-		p.Limit = 10
-	}
-
 	rows, err := dbpool.Query(ctx, "SELECT * FROM get_top_locations($1);", p.Limit)
 	if err != nil {
-		return nil, fmt.Errorf("database query failed: %v", err)
+		return nil, err
 	}
 	defer rows.Close()
-
 	var locations []Location
 	for rows.Next() {
 		var loc Location
@@ -281,13 +209,10 @@ func getTopLocations(ctx context.Context, params json.RawMessage) (interface{}, 
 func getLocationById(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ ID string `json:"id"` }
 	if err := json.Unmarshal(params, &p); err != nil || p.ID == "" {
-		return nil, fmt.Errorf("missing or invalid id")
+		return nil, fmt.Errorf("invalid or missing 'id' parameter")
 	}
-
 	var loc Location
-	err := dbpool.QueryRow(ctx, "SELECT * FROM get_location_by_id($1);", p.ID).Scan(
-		&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating,
-	)
+	err := dbpool.QueryRow(ctx, "SELECT * FROM get_location_by_id($1);", p.ID).Scan(&loc.ID, &loc.Name, &loc.Country, &loc.State, &loc.Description, &loc.SVGLink, &loc.Rating)
 	if err != nil {
 		return nil, fmt.Errorf("location not found")
 	}
@@ -297,15 +222,13 @@ func getLocationById(ctx context.Context, params json.RawMessage) (interface{}, 
 func searchLocations(ctx context.Context, params json.RawMessage) (interface{}, error) {
 	var p struct{ Query string `json:"query"` }
 	if err := json.Unmarshal(params, &p); err != nil || p.Query == "" {
-		return nil, fmt.Errorf("query is required")
+		return nil, fmt.Errorf("invalid or missing 'query' parameter")
 	}
-
 	rows, err := dbpool.Query(ctx, "SELECT * FROM search_locations($1);", p.Query)
 	if err != nil {
-		return nil, fmt.Errorf("search failed: %v", err)
+		return nil, err
 	}
 	defer rows.Close()
-
 	var locations []Location
 	for rows.Next() {
 		var loc Location
@@ -322,7 +245,7 @@ func logUserRequest(ctx context.Context, userid string) error {
 	return err
 }
 
-func logUserResponse(ctx context.Context, userid string) error {
+func logUserResponse(ctx context..Context, userid string) error {
 	_, err := dbpool.Exec(ctx, "SELECT log_user_response($1);", userid)
 	return err
 }
@@ -331,6 +254,7 @@ func isUserBlocked(ctx context.Context, userid string) (bool, error) {
 	var blocked bool
 	err := dbpool.QueryRow(ctx, "SELECT is_user_blocked($1);", userid).Scan(&blocked)
 	if err != nil {
+		// pgx.ErrNoRows is a common case if the user is not in the log table yet
 		if err.Error() == "no rows in result set" {
 			return false, nil
 		}
